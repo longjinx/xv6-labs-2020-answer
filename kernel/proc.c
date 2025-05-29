@@ -21,23 +21,6 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
-
-// Allocate a page for each process's kernel stack.
-// Map it high in memory, followed by an invalid
-// guard page.
-void
-proc_mapstacks(pagetable_t kpgtbl) {
-  struct proc *p;
-  
-  for(p = proc; p < &proc[NPROC]; p++) {
-    char *pa = kalloc();
-    if(pa == 0)
-      panic("kalloc");
-    uint64 va = KSTACK((int) (p - proc));
-    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-  }
-}
-
 // initialize the proc table at boot time.
 void
 procinit(void)
@@ -47,8 +30,12 @@ procinit(void)
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-      p->kstack = KSTACK((int) (p - proc));
+      // note for blog: 内核页表本来是只有一个的，所有进程共用，所以需要为不同进程创建多个内核栈，并 map 到不同位置
+      // lab3exp2 中，添加了为每个进程创建单独的内核页表的设计，所以可以每个页表只分配一个内核栈并 map 到固定位置。
+      // （同个页表不同位置 -> 不同页表同一位置）
   }
+
+  kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -128,6 +115,21 @@ found:
     return 0;
   }
 
+  // Make a new kernel pagetable for the new process
+  p->kernelpgtbl = kvminit_newpgtbl();
+  // printf("kernel_pagetable: %p\n", p->kernelpgtbl);
+
+  // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int)0); // fixed location for kstack position
+  // printf("map krnlstack va: %p to pa: %p\n", va, pa);
+  kvmmap(p->kernelpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -156,6 +158,22 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  
+  // free process-specific kernel stack
+  void *kstack_pa = (void *)kvmpa(p->kernelpgtbl, p->kstack);
+  // printf("trace: free kstack %p\n", kstack_pa);
+  kfree(kstack_pa);
+  p->kstack = 0;
+  
+  // proc_freepagetable can not be used here, since it not only frees the pagetable itself, 
+  // but also frees all the leaf pages within the pagetable, which in this case are critical
+  // pages for the kernel's function. kfree() only frees the pagetable itself.
+  // edit: using only kfree(p->kernelpgtbl) here will lead to memory leak since
+  // PTEs inside the kernel page table were allocated using kalloc and not freed.
+  
+  // printf("trace: freepgtbl %p\n",p->kernelpgtbl);
+  kvm_free_kernelpgtbl(p->kernelpgtbl);
+  p->kernelpgtbl = 0;
   p->state = UNUSED;
 }
 
@@ -227,6 +245,7 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  kvmcopymappings(p->pagetable, p->kernelpgtbl, 0, p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -250,11 +269,20 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    uint64 newsz;
+    if((newsz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    // synchronize kernel page-table's mapping of user memory
+    if(kvmcopymappings(p->pagetable, p->kernelpgtbl, sz, n) != 0) {
+      uvmdealloc(p->pagetable, newsz, sz);
+      return -1;
+    }
+    sz = newsz;
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uvmdealloc(p->pagetable, sz, sz + n);
+    // synchronize kernel page-table's mapping of user memory
+    sz = kvmdealloc(p->kernelpgtbl, sz, sz + n);
   }
   p->sz = sz;
   return 0;
@@ -275,7 +303,8 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0 ||
+     kvmcopymappings(np->pagetable, np->kernelpgtbl, 0, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -471,30 +500,42 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
     
-    int nproc = 0;
+    int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
-      if(p->state != UNUSED) {
-        nproc++;
-      }
       if(p->state == RUNNABLE) {
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // switch to process-specific kernel page table
+        w_satp(MAKE_SATP(p->kernelpgtbl));
+        sfence_vma();
+        // printf("trace: loaded kernel pagetable %p\n", p->kernelpgtbl);
+        
         swtch(&c->context, &p->context);
+
+        // switch kernel page table back to the globally shared kernel_pagetable
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
+
+        found = 1;
       }
       release(&p->lock);
     }
-    if(nproc <= 2) {   // only init and sh exist
+#if !defined (LAB_FS)
+    if(found == 0) {
       intr_on();
       asm volatile("wfi");
     }
+#else
+    ;
+#endif
   }
 }
 

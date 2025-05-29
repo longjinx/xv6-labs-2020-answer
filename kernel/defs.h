@@ -90,7 +90,6 @@ int             cpuid(void);
 void            exit(int);
 int             fork(void);
 int             growproc(int);
-void            proc_mapstacks(pagetable_t);
 pagetable_t     proc_pagetable(struct proc *);
 void            proc_freepagetable(pagetable_t, uint64);
 int             kill(int);
@@ -120,11 +119,6 @@ void            initlock(struct spinlock*, char*);
 void            release(struct spinlock*);
 void            push_off(void);
 void            pop_off(void);
-uint64          lockfree_read8(uint64 *addr);
-int             lockfree_read4(int *addr);
-#ifdef LAB_LOCK
-void            freelock(struct spinlock*);
-#endif
 
 // sleeplock.c
 void            acquiresleep(struct sleeplock*);
@@ -165,14 +159,23 @@ int             uartgetc(void);
 
 // vm.c
 void            kvminit(void);
+pagetable_t     kvminit_newpgtbl(void);
 void            kvminithart(void);
+uint64          kvmpa(pagetable_t, uint64);
 void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
+// void *kget_freelist(void); // used for tracing purposes in exp2
+void			kvm_free_kernelpgtbl(pagetable_t);
+int 			kvmcopymappings(pagetable_t src, pagetable_t dst, uint64 start, uint64 sz);
+uint64 			kvmdealloc(pagetable_t kernelpgtbl, uint64 oldsz, uint64 newsz);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
 void            uvminit(pagetable_t, uchar *, uint);
 uint64          uvmalloc(pagetable_t, uint64, uint64);
 uint64          uvmdealloc(pagetable_t, uint64, uint64);
+#ifdef SOL_COW
+#else
 int             uvmcopy(pagetable_t, pagetable_t, uint64);
+#endif
 void            uvmfree(pagetable_t, uint64);
 void            uvmunmap(pagetable_t, uint64, uint64, int);
 void            uvmclear(pagetable_t, uint64);
@@ -180,6 +183,7 @@ uint64          walkaddr(pagetable_t, uint64);
 int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
+int 			vmprint(pagetable_t pagetable);
 
 // plic.c
 void            plicinit(void);
@@ -197,22 +201,12 @@ void            virtio_disk_intr(void);
 
 
 
-#ifdef LAB_PGTBL
-// vmcopyin.c
-int             copyin_new(pagetable_t, char *, uint64, uint64);
-int             copyinstr_new(pagetable_t, char *, uint64, uint64);
-#endif
-
 // stats.c
 void            statsinit(void);
 void            statsinc(void);
 
 // sprintf.c
 int             snprintf(char*, int, char*, ...);
-
-#ifdef KCSAN
-void            kcsaninit();
-#endif
 
 #ifdef LAB_NET
 // pci.c
