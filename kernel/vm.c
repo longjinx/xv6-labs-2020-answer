@@ -170,7 +170,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 }
 
 // Remove npages of mappings starting from va. va must be
-// page-aligned.
+// page-aligned. The mappings must exist.
 // Optionally free the physical memory.
 void
 uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
@@ -182,12 +182,10 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0) {
-      continue; // do nothing if not mapped (lazy allocation)
-    }
-    if((*pte & PTE_V) == 0){
-      continue; // do nothing if not mapped (lazy allocation)
-    }
+    if((pte = walk(pagetable, a, 0)) == 0)
+      panic("uvmunmap: walk");
+    if((*pte & PTE_V) == 0)
+      panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -315,22 +313,33 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      continue; // page not present, assumed to be a lazy-allocated page
+      panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
-      continue; // page not present, assumed to be a lazy-allocated page
+      panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    if(*pte & PTE_W) {
+      // clear out PTE_W for parent, set PTE_COW
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // map physical page of parent directly to child (copy-on-write)
+    // since the write flag has already been cleared for the parent
+    // the child mapping won't have the write flag as well.
+    //
+    // for page that is already read-only for parent, it will be read-
+    // only for child as well.
+    // for read-only page that is also a cow page, the PTE_COW flag will
+    // be copied over to child page, making it a cow page automatically.
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       goto err;
     }
+    // for any cases above, we created a new reference to the physical
+    // page, so increase reference count by one.
+    krefpage((void*)pa);
   }
   return 0;
 
@@ -360,10 +369,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
 
-  if(uvmshouldtouch(dstva))
-    uvmlazytouch(dstva);
-
   while(len > 0){
+    if(uvmcheckcowpage(dstva))
+      uvmcowcopy(dstva);
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
@@ -387,9 +395,6 @@ int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
-
-  if(uvmshouldtouch(srcva))
-    uvmlazytouch(srcva);
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
@@ -450,60 +455,38 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     return -1;
   }
 }
-
-int pgtblprint(pagetable_t pagetable, int depth) {
-    // there are 2^9 = 512 PTEs in a page table.
-  for(int i = 0; i < 512; i++){
-    pte_t pte = pagetable[i];
-    if(pte & PTE_V) {
-      // print
-      printf("..");
-      for(int j=0;j<depth;j++) {
-        printf(" ..");
-      }
-      printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
-
-      // if not a leaf page table, recursively print out the child table
-      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
-        // this PTE points to a lower-level page table.
-        uint64 child = PTE2PA(pte);
-        pgtblprint((pagetable_t)child,depth+1);
-      }
-    }
-  }
-  return 0;
-}
-
-int vmprint(pagetable_t pagetable) {
-  printf("page table %p\n", pagetable);
-  return pgtblprint(pagetable, 0);
-}
-
-// touch a lazy-allocated page so it's mapped to an actual physical page.
-void uvmlazytouch(uint64 va) {
-  struct proc *p = myproc();
-  char *mem = kalloc();
-  if(mem == 0) {
-    // failed to allocate physical memory
-    printf("lazy alloc: out of memory\n");
-    p->killed = 1;
-  } else {
-    memset(mem, 0, PGSIZE);
-    if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
-      printf("lazy alloc: failed to map page\n");
-      kfree(mem);
-      p->killed = 1;
-    }
-  }
-  // printf("lazy alloc: %p, p->sz: %p\n", PGROUNDDOWN(va), p->sz);
-}
-
-// whether a page is previously lazy-allocated and needed to be touched before use.
-int uvmshouldtouch(uint64 va) {
+ 
+// Check if a given virtual address points to a copy-on-write page
+int uvmcheckcowpage(uint64 va) {
   pte_t *pte;
   struct proc *p = myproc();
   
   return va < p->sz // within size of memory for the process
-    && PGROUNDDOWN(va) != r_sp() // not accessing stack guard page (it shouldn't be mapped)
-    && (((pte = walk(p->pagetable, va, 0))==0) || ((*pte & PTE_V)==0)); // page table entry does not exist
+    && ((pte = walk(p->pagetable, va, 0))!=0)
+    && (*pte & PTE_V) // page table entry exists
+    && (*pte & PTE_COW); // page is a cow page
+}
+
+// Copy the cow page, then map it as writable
+int uvmcowcopy(uint64 va) {
+  pte_t *pte;
+  struct proc *p = myproc();
+
+  if((pte = walk(p->pagetable, va, 0)) == 0)
+    panic("uvmcowcopy: walk");
+  
+  // copy the cow page
+  // (no copying will take place if reference count is already 1)
+  uint64 pa = PTE2PA(*pte);
+  uint64 new = (uint64)kcopy_n_deref((void*)pa);
+  if(new == 0)
+    return -1;
+  
+  // map as writable, remove the cow flag
+  uint64 flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+  uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 0);
+  if(mappages(p->pagetable, va, 1, new, flags) == -1) {
+    panic("uvmcowcopy: mappages");
+  }
+  return 0;
 }
