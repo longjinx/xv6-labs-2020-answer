@@ -28,7 +28,6 @@ kinit()
 {
   initlock(&kmem.lock, "kmem");
   freerange(end, (void*)PHYSTOP);
-  printf("PHYSTOP is %p\n", PHYSTOP);
 }
 
 void
@@ -82,5 +81,16 @@ kalloc(void)
   return (void*)r;
 }
 
-// used for tracing purposes in exp2
-// void *kget_freelist(void) { return kmem.freelist; } 
+uint64
+count_free_mem(void) // added for counting free memory in bytes (lab2)
+{
+  acquire(&kmem.lock);
+  uint64 mem_bytes = 0;
+  struct run *r = kmem.freelist;
+  while(r){
+    mem_bytes += PGSIZE;
+    r = r->next;
+  }
+  release(&kmem.lock);
+  return mem_bytes;
+}
