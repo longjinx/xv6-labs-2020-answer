@@ -43,12 +43,16 @@ sys_sbrk(void)
 {
   int addr;
   int n;
-
+  struct proc *p = myproc();
   if(argint(0, &n) < 0)
     return -1;
-  addr = myproc()->sz;
-  if(growproc(n) < 0)
-    return -1;
+  // printf("sbrk: %d\n",n);
+  addr = p->sz;
+  // lazy allocation
+  if(n < 0) {
+    uvmdealloc(p->pagetable, p->sz, p->sz+n); // dealloc immediately
+  }
+  p->sz += n;
   return addr;
 }
 
@@ -57,8 +61,6 @@ sys_sleep(void)
 {
   int n;
   uint ticks0;
-
-  backtrace();
 
   if(argint(0, &n) < 0)
     return -1;
@@ -96,19 +98,4 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
-}
-
-uint64 sys_sigalarm(void) {
-  int n;
-  uint64 fn;
-  if(argint(0, &n) < 0)
-    return -1;
-  if(argaddr(1, &fn) < 0)
-    return -1;
-  
-  return sigalarm(n, (void(*)())(fn));
-}
-
-uint64 sys_sigreturn(void) {
-	return sigreturn();
 }

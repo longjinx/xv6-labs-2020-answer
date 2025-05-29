@@ -68,29 +68,22 @@ usertrap(void)
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
-    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    uint64 va = r_stval();
+    if((r_scause() == 13 || r_scause() == 15) && uvmshouldtouch(va)){
+      uvmlazytouch(va); // lazy page allocation
+    } else {
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      p->killed = 1;
+    }
   }
 
   if(p->killed)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2) {
-    if(p->alarm_interval != 0) {
-      if(--p->alarm_ticks <= 0) {
-        if(!p->alarm_goingoff) { // make sure alarm_handler isn't already running
-          p->alarm_ticks = p->alarm_interval;
-          // jump to execute alarm_handler
-          *p->alarm_trapframe = *p->trapframe; // backup trapframe
-          p->trapframe->epc = (uint64)p->alarm_handler;
-          p->alarm_goingoff = 1;
-        }
-      }
-    }
+  if(which_dev == 2)
     yield();
-  }
 
   usertrapret();
 }
@@ -230,18 +223,3 @@ devintr()
   }
 }
 
-int sigalarm(int ticks, void(*handler)()) {
-  struct proc *p = myproc();
-  p->alarm_interval = ticks;
-  p->alarm_handler = handler;
-  p->alarm_ticks = ticks;
-  return 0;
-}
-
-int sigreturn() {
-  // resume the state of trapframe to how it is before the alarm goes off.
-  struct proc *p = myproc();
-  *p->trapframe = *p->alarm_trapframe;
-  p->alarm_goingoff = 0;
-  return 0;
-}

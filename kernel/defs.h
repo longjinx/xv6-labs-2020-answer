@@ -80,7 +80,6 @@ int             pipewrite(struct pipe*, uint64, int);
 void            printf(char*, ...);
 void            panic(char*) __attribute__((noreturn));
 void            printfinit(void);
-void			backtrace(void);
 
 // proc.c
 int             cpuid(void);
@@ -146,8 +145,6 @@ void            trapinit(void);
 void            trapinithart(void);
 extern struct spinlock tickslock;
 void            usertrapret(void);
-int             sigalarm(int n, void(*fn)(void));
-int             sigreturn();
 
 // uart.c
 void            uartinit(void);
@@ -174,6 +171,9 @@ uint64          walkaddr(pagetable_t, uint64);
 int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
+int             vmprint(pagetable_t pagetable);
+void 			uvmlazytouch(uint64 va);
+int				uvmshouldtouch(uint64 va);
 
 // plic.c
 void            plicinit(void);
